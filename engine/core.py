@@ -222,14 +222,29 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 # ═══════════════════════════════════════════════════════════════════
-#  UTILITIES
-# ═══════════════════════════════════════════════════════════════════
+# ── LOGGER ───────────────────────────────────────────────────────
+logger = logging.getLogger("pharma_pro")
+logger.setLevel(logging.DEBUG)
+_log_formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s")
 
-def log(msg: str):
+# Console handler
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(_log_formatter)
+logger.addHandler(_console_handler)
+
+# File handler (rotates daily-ish via timestamp in filename)
+_log_file = LOG_DIR / f"scrape_{datetime.now():%Y%m%d}.log"
+_file_handler = logging.FileHandler(_log_file, encoding="utf-8")
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(_log_formatter)
+logger.addHandler(_file_handler)
+
+def log(msg: str, level: str = "info"):
     ts = datetime.now().isoformat()
     line = f"{ts} | {msg}"
     print(line, flush=True)
-    logger.info(msg)
+    getattr(logger, level.lower(), logger.info)(msg)
 
 
 from validators import BarcodeValidator, ProxyRotator, SiteErrorReporter, FuzzyMatcher, is_likely_js_rendered
@@ -383,11 +398,24 @@ def probe_shopify(sess: requests.Session, domain: str) -> Optional[str]:
             r = sess.get(url, timeout=15)
             if r.status_code == 200 and is_shopify_json(r):
                 cnt = len(r.json().get("products", []))
-                log(f"[{domain}] Shopify JSON @ {url} ({cnt} products)")
+                log(f"[{domain}] Shopify JSON @ {url} ({cnt} products)", "success")
                 return url
-        except Exception:
-            pass
+            elif r.status_code == 200:
+                log(f"[{domain}] 200 OK but not Shopify JSON — likely {r.headers.get('content-type','unknown')[:40]}", "warning")
+            elif r.status_code == 429:
+                log(f"[{domain}] rate limited (429)", "warning")
+                time.sleep(3)
+                continue
+            elif r.status_code == 403:
+                log(f"[{domain}] blocked (403)", "warning")
+            else:
+                log(f"[{domain}] HTTP {r.status_code}", "warning")
+        except requests.exceptions.Timeout:
+            log(f"[{domain}] timeout probing {url}", "warning")
+        except Exception as e:
+            log(f"[{domain}] error probing: {e}", "warning")
         time.sleep(0.2)
+    log(f"[{domain}] No Shopify JSON endpoint found — skipping", "warning")
     return None
 
 
@@ -518,20 +546,36 @@ def run_shopify_batch(targets: List[str], batch_label: str = "batch",
                 results.append({"site": domain, "status": "success", "products": p, "variants": v, "url": ep})
             else:
                 # Try detecting JS-rendered site
-                r = sess.get(f"https://{domain}", timeout=10)
-                if is_likely_js_rendered(r.text):
+                try:
+                    r = sess.get(f"https://{domain}", timeout=10)
+                except Exception:
+                    r = None
+                if r and is_likely_js_rendered(r.text):
                     reporter.log(domain, "js_rendered", "Site appears JS-rendered (Next.js/Nuxt/Vue/Angular detected)", {"status": r.status_code})
                     results.append({"site": domain, "status": "js_required", "products": 0, "variants": 0, "reason": "JS-rendered site — needs Selenium/Playwright"})
                 else:
-                    reporter.log(domain, "no_shopify", "No Shopify JSON endpoint found", {"status": r.status_code})
-                    results.append({"site": domain, "status": "failed", "products": 0, "variants": 0, "reason": "No Shopify JSON"})
+                    # HTML fallback for non-Shopify sites
+                    log(f"[{domain}] Trying HTML fallback...", "info")
+                    from html_fallback import probe_and_scrape_html
+                    p, v = probe_and_scrape_html(sess, domain, batch_label, conn, msg_queue, stop_event)
+                    if p > 0:
+                        grand_products += p
+                        grand_variants += v
+                        results.append({"site": domain, "status": "html_fallback", "products": p, "variants": v, "reason": "Scraped via HTML fallback"})
+                        log(f"[{domain}] HTML fallback: {p} products", "success")
+                    else:
+                        reporter.log(domain, "no_catalog", "No Shopify JSON and no products found via HTML fallback", {"status": r.status_code if r else "timeout"})
+                        results.append({"site": domain, "status": "failed", "products": 0, "variants": 0, "reason": "No Shopify JSON; HTML fallback found nothing"})
         except Exception as e:
             reporter.log(domain, "exception", str(e), {})
             results.append({"site": domain, "status": "error", "products": 0, "variants": 0, "reason": str(e)})
         time.sleep(0.5)
 
     close_conn(conn)
-    log(f"\n{'='*60}\nSHOPIFY BATCH SUMMARY\n  Products: {grand_products}\n  Variants: {grand_variants}\n  JS-rendered sites: {sum(1 for r in results if r['status']=='js_required')}\n  Failed sites: {sum(1 for r in results if r['status']=='failed')}\n{'='*60}")
+    html_sites = sum(1 for r in results if r['status']=='html_fallback')
+    js_sites = sum(1 for r in results if r['status']=='js_required')
+    failed_sites = sum(1 for r in results if r['status']=='failed')
+    log(f"\n{'='*60}\nBATCH SUMMARY\n  Products: {grand_products}\n  Variants: {grand_variants}\n  Shopify sites: {sum(1 for r in results if r['status']=='success')}\n  HTML fallback sites: {html_sites}\n  JS-rendered sites: {js_sites}\n  Failed sites: {failed_sites}\n{'='*60}")
     if reporter.errors:
         report_path = REPORT_DIR / f"error_report_{datetime.now():%Y%m%d_%H%M%S}.json"
         reporter.export_json(str(report_path))

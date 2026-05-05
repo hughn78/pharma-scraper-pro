@@ -419,7 +419,7 @@ class PharmaScraperProGUI:
 
     def run_worker(self, target, on_done=None):
         self.stop_event.clear()
-        self.worker_thread = threading.Thread(target=self._worker_wrapper, args=(target, on_done), daemon=True)
+        self.worker_thread = threading.Thread(target=self._worker_wrapper, args=(target, on_done), daemon=False)
         self.worker_thread.start()
         self.scrape_btn.config(state=DISABLED)
         self.stop_btn.config(state=NORMAL)
@@ -434,8 +434,11 @@ class PharmaScraperProGUI:
             if on_done:
                 self.root.after(0, lambda: on_done(result))
         except Exception as e:
-            logger.error(f"Worker error: {e}", exc_info=True)
-            self.msg_queue.put({"type": "error", "message": str(e)})
+            import traceback
+            err_msg = f"Worker crashed: {e}\n{traceback.format_exc()}"
+            logger.error(err_msg)
+            self.msg_queue.put({"type": "error", "message": err_msg})
+            self.root.after(0, lambda: messagebox.showerror("Worker Error", str(e)))
         finally:
             self.root.after(0, self._worker_done)
 
@@ -471,11 +474,20 @@ class PharmaScraperProGUI:
 
     def _on_scrape_done(self, result):
         for site in result.get("sites", []):
-            icon = "✅" if site["status"] == "success" else "❌"
+            status = site["status"]
+            if status == "success":
+                icon = "✅"
+            elif status == "html_fallback":
+                icon = "📄"
+            else:
+                icon = "❌"
             self.scrape_tree.insert("", END, values=(
-                site["site"], site.get("products",0), site.get("variants",0), site["status"]))
-        self.log_activity(f"Scrape complete: {result['total_products']} products, {result['total_variants']} variants", "success")
-        messagebox.showinfo("Scrape Complete", f"Products: {result['total_products']:,}\nVariants: {result['total_variants']:,}")
+                site["site"], site.get("products",0), site.get("variants",0), status))
+        shopify = sum(1 for s in result.get("sites",[]) if s["status"]=="success")
+        html_fb = sum(1 for s in result.get("sites",[]) if s["status"]=="html_fallback")
+        failed = sum(1 for s in result.get("sites",[]) if s["status"] in ("failed","error"))
+        self.log_activity(f"Scrape complete: {result['total_products']} products, {result['total_variants']} variants (Shopify: {shopify}, HTML: {html_fb}, Failed: {failed})", "success")
+        messagebox.showinfo("Scrape Complete", f"Products: {result['total_products']:,}\nVariants: {result['total_variants']:,}\nShopify sites: {shopify}\nHTML fallback: {html_fb}\nFailed: {failed}")
 
     # ── Canonical ───────────────────────────────────────────────────
     def start_canonical(self):
@@ -494,7 +506,7 @@ class PharmaScraperProGUI:
         c.execute("SELECT id, canonical_name, canonical_brand, canonical_barcode, canonical_size, canonical_category FROM canonical_products ORDER BY id DESC LIMIT 100")
         for row in c.fetchall():
             self.canon_tree.insert("", END, values=row)
-        conn.close()
+        core.close_conn(conn)
 
     # ── Enrich ──────────────────────────────────────────────────────
     def start_enrich(self):
@@ -521,7 +533,7 @@ class PharmaScraperProGUI:
         """)
         for row in c.fetchall():
             self.enrich_tree.insert("", END, values=row)
-        conn.close()
+        core.close_conn(conn)
 
     def start_crossdomain(self):
         self.run_worker(
@@ -684,7 +696,7 @@ FOS enriched: {stats['fos_enriched']:,}"""
                 c.execute("DELETE FROM source_products")
                 c.execute("DELETE FROM canonical_products")
                 conn.commit()
-                conn.close()
+                core.close_conn(conn)
                 self.log_activity("Database cleared", "warning")
                 self.refresh_stats()
             except Exception as e:
@@ -739,7 +751,7 @@ Output: {self.export_dir_var.get()}"""
         from validators import search_canonical_by_text
         conn = core.get_conn()
         results = search_canonical_by_text(conn, query, limit=50)
-        conn.close()
+        core.close_conn(conn)
         self.search_tree.delete(*self.search_tree.get_children())
         for r in results:
             self.search_tree.insert("", END, values=(
@@ -756,7 +768,7 @@ Output: {self.export_dir_var.get()}"""
         from validators import search_fos_by_text
         conn = core.get_conn()
         results = search_fos_by_text(conn, query, limit=50)
-        conn.close()
+        core.close_conn(conn)
         self.search_tree.delete(*self.search_tree.get_children())
         for r in results:
             self.search_tree.insert("", END, values=(
