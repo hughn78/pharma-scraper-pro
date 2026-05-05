@@ -141,9 +141,31 @@ SHOPIFY_PROBES = [
 # ═══════════════════════════════════════════════════════════════════
 
 def get_conn():
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    """Acquire a connection from the thread-safe pool."""
+    from db_utils import get_pooled_conn, set_pool
+    global _pool_initialized
+    try:
+        _pool_initialized
+    except NameError:
+        _pool_initialized = False
+    if not _pool_initialized:
+        set_pool(DB_PATH, max_conn=4)
+        _pool_initialized = True
+    return get_pooled_conn()
+
+def close_conn(conn):
+    """Release a connection back to the pool."""
+    from db_utils import release_conn
+    release_conn(conn)
+
+def _init_pool():
+    from db_utils import set_pool, ensure_indexes
+    set_pool(DB_PATH, max_conn=4)
+    conn = get_conn()
+    ensure_indexes(conn)
+    close_conn(conn)
+    global _pool_initialized
+    _pool_initialized = True
 
 
 def init_db() -> sqlite3.Connection:
@@ -508,7 +530,7 @@ def run_shopify_batch(targets: List[str], batch_label: str = "batch",
             results.append({"site": domain, "status": "error", "products": 0, "variants": 0, "reason": str(e)})
         time.sleep(0.5)
 
-    conn.close()
+    close_conn(conn)
     log(f"\n{'='*60}\nSHOPIFY BATCH SUMMARY\n  Products: {grand_products}\n  Variants: {grand_variants}\n  JS-rendered sites: {sum(1 for r in results if r['status']=='js_required')}\n  Failed sites: {sum(1 for r in results if r['status']=='failed')}\n{'='*60}")
     if reporter.errors:
         report_path = REPORT_DIR / f"error_report_{datetime.now():%Y%m%d_%H%M%S}.json"
@@ -623,7 +645,7 @@ def canonicalise(msg_queue: Optional[queue.Queue] = None,
     total_canonical = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM canonical_sources")
     total_links = c.fetchone()[0]
-    conn.close()
+    close_conn(conn)
 
     log(f"Canonicalisation complete: {inserted} new, {linked} barcode-linked, {fuzzy_linked} fuzzy-linked. Total canonicals: {total_canonical}")
     return {"inserted": inserted, "linked": linked, "fuzzy_linked": fuzzy_linked,
@@ -636,33 +658,48 @@ def canonicalise(msg_queue: Optional[queue.Queue] = None,
 
 def enrich_fos(fos_path: str, msg_queue: Optional[queue.Queue] = None,
                stop_event: Optional[threading.Event] = None) -> Dict[str, Any]:
-    from thefuzz import fuzz as thefuzz_fuzz
+    from rapidfuzz import fuzz as rapidfuzz_fuzz
 
     fos_path = Path(fos_path)
     if not fos_path.exists():
         return {"error": f"FOS file not found: {fos_path}"}
 
     log(f"Reading FOS report from {fos_path}")
-    fos_df = pd.read_excel(fos_path, sheet_name='Stock Report')
+    fos_raw = pd.read_excel(fos_path, sheet_name='Stock Report')
+
+    # ── FOS Column Guard ──────────────────────────────────────────
+    from db_utils import FOSColumnGuard
+    guard = FOSColumnGuard(list(fos_raw.columns))
+    guard_report = guard.report()
+    log(f"FOS column guard: {guard_report}")
+    if not guard_report["safe"]:
+        missing = guard_report.get("missing_expected", [])
+        mapped = guard_report.get("mapped_columns", {})
+        return {"error": f"FOS column mismatch. Missing expected: {missing}. Mapped: {mapped}"}
+    if guard_report["warning"]:
+        log(f"FOS column warnings — unexpected: {guard_report.get('unexpected_columns', [])}")
+    fos_df = guard.rename_df(fos_raw)
+    # ─────────────────────────────────────────────────────────────
+
     log(f"FOS rows: {len(fos_df):,}")
 
-    # Clean APNs
-    fos_df['APN'] = fos_df['APN'].astype(str).str.strip()
-    fos_df['APN'] = fos_df['APN'].replace(['nan', 'None', ''], pd.NA)
+    # Clean APNs using canonical name
+    fos_df['apn'] = fos_df['apn'].astype(str).str.strip()
+    fos_df['apn'] = fos_df['apn'].replace(['nan', 'None', ''], pd.NA)
 
     # Build APN lookup
     apn_lookup = {}
-    for _, row in fos_df[fos_df['APN'].notna()].iterrows():
-        apn = str(row['APN']).strip()
+    for _, row in fos_df[fos_df['apn'].notna()].iterrows():
+        apn = str(row['apn']).strip()
         if len(apn) >= 8:
             apn_lookup[apn] = {
-                'stock_name': row.get('Stock Name', ''),
-                'full_name': row.get('Full Name', ''),
-                'cost': row.get('Cost', 0), 'avg_cost': row.get('Avg Cost', 0),
-                'sell_price': row.get('Sell Price', 0), 'soh': row.get('SOH', 0),
-                'margin_pct': row.get('Margin % (end date)', 0),
-                'categories': row.get('Categories', ''), 'dept': row.get('Dept', ''),
-                'qty_sold': row.get('Qty Sold', 0), 'sales_val': row.get('Sales Val', 0),
+                'stock_name': row.get('stock_name', ''),
+                'full_name': row.get('full_name', ''),
+                'cost': row.get('cost', 0), 'avg_cost': row.get('avg_cost', 0),
+                'sell_price': row.get('sell_price', 0), 'soh': row.get('soh', 0),
+                'margin_pct': row.get('margin_pct', 0),
+                'categories': row.get('categories', ''), 'dept': row.get('dept', ''),
+                'qty_sold': row.get('qty_sold', 0), 'sales_val': row.get('sales_val', 0),
             }
     log(f"Unique APNs in FOS: {len(apn_lookup):,}")
 
@@ -719,9 +756,9 @@ def enrich_fos(fos_path: str, msg_queue: Optional[queue.Queue] = None,
     log(f"Fuzzy matching {len(fuzzy_candidates)} unenriched canonicals...")
 
     fos_names = []
-    for _, row in fos_df[fos_df['Full Name'].notna()].iterrows():
-        fos_names.append((str(row['APN']) if pd.notna(row['APN']) else '', row['Full Name'], row['Stock Name'],
-                          norm_str(row['Full Name'])))
+    for _, row in fos_df[fos_df['full_name'].notna()].iterrows():
+        fos_names.append((str(row['apn']) if pd.notna(row['apn']) else '', row['full_name'], row['stock_name'],
+                          norm_str(row['full_name'])))
 
     fuzzy_matches = 0
     for cid, c_name in fuzzy_candidates:
@@ -732,7 +769,7 @@ def enrich_fos(fos_path: str, msg_queue: Optional[queue.Queue] = None,
         for apn, f_name, f_stock, f_norm in fos_names:
             if not f_norm:
                 continue
-            score = thefuzz_fuzz.ratio(c_norm, f_norm)
+            score = rapidfuzz_fuzz.ratio(c_norm, f_norm)
             if score > best_score:
                 best_score, best_match = score, (apn, f_name, f_stock)
         if best_score >= 85 and best_match:
@@ -760,7 +797,7 @@ def enrich_fos(fos_path: str, msg_queue: Optional[queue.Queue] = None,
 
     c.execute("SELECT COUNT(*) FROM canonical_products WHERE fos_apn IS NOT NULL")
     total_enriched = c.fetchone()[0]
-    conn.close()
+    close_conn(conn)
     return {"exact": exact_matches, "fuzzy": fuzzy_matches, "total_enriched": total_enriched}
 
 
@@ -770,7 +807,7 @@ def enrich_fos(fos_path: str, msg_queue: Optional[queue.Queue] = None,
 
 def cross_domain_barcode_merge(msg_queue: Optional[queue.Queue] = None,
                                 stop_event: Optional[threading.Event] = None) -> Dict[str, Any]:
-    from thefuzz import fuzz as thefuzz_fuzz
+    from rapidfuzz import fuzz as rapidfuzz_fuzz
     conn = get_conn()
     c = conn.cursor()
 
@@ -800,7 +837,7 @@ def cross_domain_barcode_merge(msg_queue: Optional[queue.Queue] = None,
             s_norm = norm_str(s_name)
             if c_brand_norm and norm_str(s_brand or '') != c_brand_norm:
                 continue
-            score = thefuzz_fuzz.ratio(c_norm, s_norm)
+            score = rapidfuzz_fuzz.ratio(c_norm, s_norm)
             if score > best_score:
                 best_score, best_barcode = score, barcode
 
@@ -824,7 +861,7 @@ def cross_domain_barcode_merge(msg_queue: Optional[queue.Queue] = None,
     total = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM canonical_products WHERE canonical_barcode IS NOT NULL AND canonical_barcode!=''")
     with_bc = c.fetchone()[0]
-    conn.close()
+    close_conn(conn)
     log(f"Cross-domain merge complete: {merged} merged. Total canonicals: {total}, with barcode: {with_bc} ({with_bc/total*100:.1f}%)")
     return {"merged": merged, "total_canonical": total, "with_barcode": with_bc, "barcode_pct": with_bc/total*100}
 
@@ -997,7 +1034,7 @@ def price_analysis(msg_queue: Optional[queue.Queue] = None,
         no_price.to_excel(writer, sheet_name="No_FOS_Price", index=False)
         cat_summary.to_excel(writer, sheet_name="Category_Summary")
 
-    conn.close()
+    close_conn(conn)
     size_mb = out_path.stat().st_size / (1024 * 1024)
     log(f"Price analysis exported: {out_path} ({size_mb:.1f} MB, {total} rows)")
     return {"path": str(out_path), "rows": total, "underpriced": len(underpriced),
@@ -1093,7 +1130,7 @@ def export_workbook(msg_queue: Optional[queue.Queue] = None) -> Dict[str, Any]:
     """)
     ebay_df = pd.DataFrame([dict(r) for r in c.fetchall()])
 
-    conn.close()
+    close_conn(conn)
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         can_df.to_excel(writer, sheet_name="Canonical_Products", index=False)
@@ -1126,7 +1163,7 @@ def get_dashboard_stats() -> Dict[str, Any]:
     stats["fos_enriched"] = c.fetchone()[0]
     c.execute("SELECT COUNT(DISTINCT source_domain) FROM source_products")
     stats["sites_scraped"] = c.fetchone()[0]
-    conn.close()
+    close_conn(conn)
     return stats
 
 
