@@ -210,23 +210,11 @@ def log(msg: str):
     logger.info(msg)
 
 
+from validators import BarcodeValidator, ProxyRotator, SiteErrorReporter, FuzzyMatcher, is_likely_js_rendered
+
 def norm_barcode(val) -> str:
-    if not val:
-        return ""
-    val = str(val).strip()
-    if "E+" in val or "e+" in val:
-        try:
-            val = str(int(float(val)))
-        except Exception:
-            pass
-    val = re.sub(r"\D", "", val)
-    if len(val) in (8, 12, 13, 14):
-        return val
-    if len(val) == 11:
-        return "0" + val
-    if len(val) == 10:
-        return "00" + val
-    return ""
+    """Normalize and validate a barcode using check-digit verification."""
+    return BarcodeValidator.normalize(val)
 
 
 def first_valid_barcode(*values) -> str:
@@ -257,7 +245,8 @@ def extract_size(name: str) -> Tuple[str, str]:
 
 
 def sim(a: str, b: str) -> float:
-    return SequenceMatcher(None, a, b).ratio()
+    """High-performance fuzzy similarity using rapidfuzz."""
+    return FuzzyMatcher.ratio(a, b)
 
 
 def get_session() -> requests.Session:
@@ -476,8 +465,13 @@ def scrape_shopify(sess: requests.Session, endpoint: str, domain: str, batch_lab
 
 def run_shopify_batch(targets: List[str], batch_label: str = "batch",
                       msg_queue: Optional[queue.Queue] = None,
-                      stop_event: Optional[threading.Event] = None) -> Dict[str, Any]:
+                      stop_event: Optional[threading.Event] = None,
+                      proxies: Optional[List[str]] = None) -> Dict[str, Any]:
     sess = get_session()
+    rotator = ProxyRotator(proxies)
+    reporter = SiteErrorReporter()
+    if rotator.proxies:
+        log(f"Proxy rotation enabled: {len(rotator.proxies)} proxies")
     conn = get_conn()
     grand_products = 0
     grand_variants = 0
@@ -489,19 +483,38 @@ def run_shopify_batch(targets: List[str], batch_label: str = "batch",
         log(f"\n({idx}/{len(targets)}) {domain}")
         if msg_queue:
             msg_queue.put({"type": "site_start", "idx": idx, "total": len(targets), "domain": domain})
-        ep = probe_shopify(sess, domain)
-        if ep:
-            p, v = scrape_shopify(sess, ep, domain, batch_label, conn, msg_queue, stop_event)
-            grand_products += p
-            grand_variants += v
-            results.append({"site": domain, "status": "success", "products": p, "variants": v, "url": ep})
-        else:
-            results.append({"site": domain, "status": "failed", "products": 0, "variants": 0, "reason": "No Shopify JSON"})
+        # Rotate proxy per site
+        if rotator.proxies:
+            rotator.rotate_for_session(sess)
+            log(f"  Using proxy: {sess.proxies.get('http', 'none')}")
+        try:
+            ep = probe_shopify(sess, domain)
+            if ep:
+                p, v = scrape_shopify(sess, ep, domain, batch_label, conn, msg_queue, stop_event)
+                grand_products += p
+                grand_variants += v
+                results.append({"site": domain, "status": "success", "products": p, "variants": v, "url": ep})
+            else:
+                # Try detecting JS-rendered site
+                r = sess.get(f"https://{domain}", timeout=10)
+                if is_likely_js_rendered(r.text):
+                    reporter.log(domain, "js_rendered", "Site appears JS-rendered (Next.js/Nuxt/Vue/Angular detected)", {"status": r.status_code})
+                    results.append({"site": domain, "status": "js_required", "products": 0, "variants": 0, "reason": "JS-rendered site — needs Selenium/Playwright"})
+                else:
+                    reporter.log(domain, "no_shopify", "No Shopify JSON endpoint found", {"status": r.status_code})
+                    results.append({"site": domain, "status": "failed", "products": 0, "variants": 0, "reason": "No Shopify JSON"})
+        except Exception as e:
+            reporter.log(domain, "exception", str(e), {})
+            results.append({"site": domain, "status": "error", "products": 0, "variants": 0, "reason": str(e)})
         time.sleep(0.5)
 
     conn.close()
-    log(f"\n{'='*60}\nSHOPIFY BATCH SUMMARY\n  Products: {grand_products}\n  Variants: {grand_variants}\n{'='*60}")
-    return {"total_products": grand_products, "total_variants": grand_variants, "sites": results}
+    log(f"\n{'='*60}\nSHOPIFY BATCH SUMMARY\n  Products: {grand_products}\n  Variants: {grand_variants}\n  JS-rendered sites: {sum(1 for r in results if r['status']=='js_required')}\n  Failed sites: {sum(1 for r in results if r['status']=='failed')}\n{'='*60}")
+    if reporter.errors:
+        report_path = REPORT_DIR / f"error_report_{datetime.now():%Y%m%d_%H%M%S}.json"
+        reporter.export_json(str(report_path))
+        log(f"Error report saved: {report_path}")
+    return {"total_products": grand_products, "total_variants": grand_variants, "sites": results, "error_report": str(report_path) if reporter.errors else ""}
 
 
 # ═══════════════════════════════════════════════════════════════════

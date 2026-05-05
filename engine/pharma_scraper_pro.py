@@ -122,6 +122,7 @@ class PharmaScraperProGUI:
         self.build_enrich_tab()
         self.build_price_tab()
         self.build_export_tab()
+        self.build_search_tab()
         self.build_settings_tab()
         self.build_logs_tab()
 
@@ -346,12 +347,39 @@ class PharmaScraperProGUI:
         ttk.Entry(db, textvariable=self.db_path_var, width=70).pack(fill=X, padx=5)
         ttk.Button(db, text="Browse", command=self.browse_db).pack(anchor="e", padx=5, pady=2)
 
+        proxy = ttk.LabelFrame(frame, text="Proxy Settings (one per line)", padding=10)
+        proxy.pack(fill=X, padx=10, pady=5)
+        self.proxy_text = Text(proxy, height=4, width=70)
+        self.proxy_text.pack(fill=X, padx=5)
+        self.proxy_text.insert(END, self.config.get("proxies", ""))
+        ttk.Label(proxy, text="Format: http://user:pass@host:port or http://host:port", foreground="#7f8c8d").pack(anchor="w", padx=5)
+
         scrape = ttk.LabelFrame(frame, text="Scraping", padding=10)
         scrape.pack(fill=X, padx=10, pady=5)
         self.aggressive_barcode_var = BooleanVar(value=self.config.get("aggressive_barcode", True))
         ttk.Checkbutton(scrape, text="Aggressive barcode extraction (slower, more accurate)", variable=self.aggressive_barcode_var).pack(anchor="w")
 
         ttk.Button(frame, text="💾 Save Settings", command=self.save_settings).pack(anchor="e", padx=10, pady=10)
+
+    def build_search_tab(self):
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="🔎 Search")
+        ctrl = ttk.LabelFrame(frame, text="Manual Product Search", padding=10)
+        ctrl.pack(fill=X, padx=10, pady=5)
+        self.search_var = StringVar()
+        ttk.Entry(ctrl, textvariable=self.search_var, width=40).pack(side=LEFT, padx=5)
+        ttk.Button(ctrl, text="Search Canonical", command=self.search_canonical).pack(side=LEFT, padx=5)
+        ttk.Button(ctrl, text="Search FOS", command=self.search_fos).pack(side=LEFT, padx=5)
+
+        results = ttk.LabelFrame(frame, text="Results", padding=5)
+        results.pack(fill=BOTH, expand=True, padx=10, pady=5)
+        cols = ("id","name","brand","barcode","size","category","fos_price","soh")
+        self.search_tree = ttk.Treeview(results, columns=cols, show="headings", height=20)
+        for col, w, h in [("id",60,"ID"),("name",250,"Name"),("brand",120,"Brand"),("barcode",130,"Barcode"),
+                          ("size",80,"Size"),("category",120,"Category"),("fos_price",80,"FOS Price"),("soh",60,"SOH")]:
+            self.search_tree.heading(col, text=h)
+            self.search_tree.column(col, width=w)
+        self.search_tree.pack(fill=BOTH, expand=True)
 
     # ── Logs ────────────────────────────────────────────────────────
     def build_logs_tab(self):
@@ -434,8 +462,9 @@ class PharmaScraperProGUI:
         self.scrape_progress["maximum"] = len(targets)
         self.scrape_progress["value"] = 0
         batch = datetime.now().strftime("%Y%m%d_%H%M")
+        proxies = [p.strip() for p in self.config.get("proxies", "").split("\n") if p.strip()]
         self.run_worker(
-            lambda: core.run_shopify_batch(targets, batch, self.msg_queue, self.stop_event),
+            lambda: core.run_shopify_batch(targets, batch, self.msg_queue, self.stop_event, proxies),
             on_done=self._on_scrape_done,
         )
         self.log_activity(f"Scraping {len(targets)} sites...", "info")
@@ -698,9 +727,45 @@ Output: {self.export_dir_var.get()}"""
         self.config["db_path"] = self.db_path_var.get()
         self.config["export_dir"] = self.export_dir_var.get()
         self.config["aggressive_barcode"] = self.aggressive_barcode_var.get()
+        self.config["proxies"] = self.proxy_text.get(1.0, END).strip()
         core.save_config(self.config)
         self.log_activity("Settings saved", "info")
         messagebox.showinfo("Saved", "Settings saved to config.json")
+
+    def search_canonical(self):
+        query = self.search_var.get().strip()
+        if not query:
+            return
+        from validators import search_canonical_by_text
+        conn = core.get_conn()
+        results = search_canonical_by_text(conn, query, limit=50)
+        conn.close()
+        self.search_tree.delete(*self.search_tree.get_children())
+        for r in results:
+            self.search_tree.insert("", END, values=(
+                r.get("id",""), r.get("canonical_name",""), r.get("canonical_brand",""),
+                r.get("canonical_barcode",""), r.get("canonical_size",""),
+                r.get("canonical_category",""), f"${r.get('fos_sell_price','')}" if r.get('fos_sell_price') else "",
+                r.get("fos_soh",""),
+            ))
+
+    def search_fos(self):
+        query = self.search_var.get().strip()
+        if not query:
+            return
+        from validators import search_fos_by_text
+        conn = core.get_conn()
+        results = search_fos_by_text(conn, query, limit=50)
+        conn.close()
+        self.search_tree.delete(*self.search_tree.get_children())
+        for r in results:
+            self.search_tree.insert("", END, values=(
+                r.get("canonical_id",""),
+                f"{r.get('fos_stock_name','')} / {r.get('canonical_name','')}",
+                "", r.get("fos_apn",""), "", "",
+                r.get("match_type",""),
+                f"{r.get('match_confidence',0):.2f}",
+            ))
 
     def load_config_dialog(self):
         p = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
